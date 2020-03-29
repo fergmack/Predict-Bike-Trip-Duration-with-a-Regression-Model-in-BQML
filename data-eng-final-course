@@ -1,0 +1,187 @@
+Explore bike data for feature engineering
+The first step of solving an ML problem is to formulate it -- to identify features of our model and the label. Since the goal of our first model is to predict the duration of a rental based on our historical dataset of cycle rentals, the label is the duration of the rental.
+
+If we believe that the duration will vary based on the station the bicycle is being rented at, the day of the week, and the time of day, those could be our features. Before we go ahead and create a model with these features, though, it’s a good idea to verify that these factors do influence the label.
+
+Coming up with features for a machine learning model is called feature engineering. Feature engineering is often the most important part of building accurate ML models, and can be much more impactful than deciding which algorithm to use or tuning hyper-parameters. Good feature engineering requires deep understanding of the data and the domain. It is often a process of hypothesis testing; you have an idea for a feature, you check to see if it works (has mutual information with the label), and then you add it to the model. If it doesn’t work, you try again.
+
+SELECT
+  start_station_name,
+  AVG(duration) AS duration
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+GROUP BY
+  start_station_name
+  
+ It is clear that a handful of stations are associated with long-duration rentals (over 3000 seconds), but that the majority of stations have durations that lie in a relatively narrow range. Had all the stations in London been associated with durations within a narrow range, the station at which the rental commenced would not have been a good feature. But in this problem, as the graph demonstrates, the start_station_name does matter.
+
+Note that we cannot use end_station_name as a feature because at the time the bicycle is being rented, we won’t know where the bicycle is going to be returned to. Because we are creating a machine learning model to predict events in the future, we need to be mindful of not using any columns that will not be known at the time the prediction is made. This time/causality criterion imposes constraints on what features we can use.
+
+Based on the exploration of the bicycles dataset and the relationship of various columns to the label column, we can prepare the training dataset by pulling out the selected features and the label
+
+SELECT
+  duration,
+  start_station_name,
+  CAST(EXTRACT(dayofweek
+    FROM
+      start_date) AS STRING) AS dayofweek,
+  CAST(EXTRACT(hour
+    FROM
+      start_date) AS STRING) AS hourofday
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+  
+  Feature columns have to be either numeric (INT64, FLOAT64, etc.) or categorical (STRING). If the feature is numeric but needs to be treated as categorical, we need to cast it as a string -- this explains why we casted the dayofweek and hourofday columns which are integers (in the ranges 1-7 and 0-23, respectively) into strings.
+
+If preparing the data involves computationally expensive transformations or joins, it might be a good idea to save the prepared training data as a table so as to not repeat that work during experimentation. If the transformations are trivial but the query itself is long-winded, it might be convenient to avoid repetitiveness by saving it as a view.
+
+In this case, the query is simple and short, and so, for clarity, we won't be saving it.
+
+Create a dataset in BigQuery called bike_model to store your model. Set the Data location to the EU region since the data we are training on is in the EU.
+
+To train the ML model and save it into the dataset bike_model, we need to call CREATE MODEL, which works similarly to CREATE TABLE. Since the label we're trying to predict is numeric this is a regression problem, which is why the most appropriate option is to choose linear_reg as the model type under OPTIONS. Enter the following query into the query editor:
+
+CREATE OR REPLACE MODEL
+  bike_model.model
+OPTIONS
+  (input_label_cols=['duration'],
+    model_type='linear_reg') AS
+SELECT
+  duration,
+  start_station_name,
+  CAST(EXTRACT(dayofweek
+    FROM
+      start_date) AS STRING) AS dayofweek,
+  CAST(EXTRACT(hour
+    FROM
+      start_date) AS STRING) AS hourofday
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+  
+Note, the model takes 2-3 minutes to train.
+
+To see some metrics related to model training, enter the following query into the BigQuery editor window:
+
+SELECT * FROM ML.EVALUATE(MODEL `bike_model.model`)
+
+The mean absolute error is 1026 seconds or about 17 minutes. This means that we should expect to be able to predict the duration of bicycle rentals with an average error of about 17 minutes.
+
+
+Improving the model through feature engineering
+
+Combine days of week
+There are other ways that we could have chosen to represent the features that we have. For example, recall that when we explored the relationship between dayofweek and the duration of rentals, we found that durations were longer on weekends than on weekdays. Therefore, instead of treating the raw value of dayofweek as a feature, we can employ this insight by fusing several dayofweek values into the weekday category
+
+CREATE OR REPLACE MODEL
+  bike_model.model_weekday
+OPTIONS
+  (input_label_cols=['duration'],
+    model_type='linear_reg') AS
+SELECT
+  duration,
+  start_station_name,
+IF
+  (EXTRACT(dayofweek
+    FROM
+      start_date) BETWEEN 2 AND 6,
+    'weekday',
+    'weekend') AS dayofweek,
+  CAST(EXTRACT(hour
+    FROM
+      start_date) AS STRING) AS hourofday
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+  
+This model results in a mean absolute error of 967 seconds which is less than the 1026 seconds for the original model. Improvement!
+
+Bucketize hour of day
+Based on the relationship between hourofday and the duration, we can experiment with bucketizing the variable into 4 bins; (-inf,5), [5,10), [10,17), and [17,inf).
+
+Build a BigQuery ML model with the bucketized hour of day, and combined days of week features using the query below:
+
+CREATE OR REPLACE MODEL
+  bike_model.model_bucketized
+OPTIONS
+  (input_label_cols=['duration'],
+    model_type='linear_reg') AS
+SELECT
+  duration,
+  start_station_name,
+IF
+  (EXTRACT(dayofweek
+    FROM
+      start_date) BETWEEN 2 AND 6,
+    'weekday',
+    'weekend') AS dayofweek,
+  ML.BUCKETIZE(EXTRACT(hour
+    FROM
+      start_date),
+    [5, 10, 17]) AS hourofday
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+  
+  
+This model results in a mean absolute error of 901 seconds which is less than the 967 seconds for the weekday-weekend model. Futher improvement!
+
+Make predictions
+Our best model contains several data transformations. Wouldn’t it be nice if BigQuery could remember the sets of transformations we did at the time of training and automatically apply them at the time of prediction? It can, using the TRANSFORM clause!
+
+In this case, the resulting model requires just the start_station_name and start_date to predict the duration. The transformations are saved and carried out on the provided raw data to create input features for the model. The main advantage of placing all preprocessing functions inside the TRANSFORM clause is that clients of the model do not have to know what kind of preprocessing has been carried out.
+
+Build a BigQuery ML model with the TRANSFORM clause that incorporates the bucketized hour of day, and combined days of week features using the query below:
+
+CREATE OR REPLACE MODEL
+  bike_model.model_bucketized TRANSFORM(* EXCEPT(start_date),
+  IF
+    (EXTRACT(dayofweek
+      FROM
+        start_date) BETWEEN 2 AND 6,
+      'weekday',
+      'weekend') AS dayofweek,
+    ML.BUCKETIZE(EXTRACT(HOUR
+      FROM
+        start_date),
+      [5, 10, 17]) AS hourofday )
+OPTIONS
+  (input_label_cols=['duration'],
+    model_type='linear_reg') AS
+SELECT
+  duration,
+  start_station_name,
+  start_date
+FROM
+  `bigquery-public-data`.london_bicycles.cycle_hire
+  
+With the TRANSFORM clause in place, enter this query to predict the duration of a rental from Park Lane right now (your result will vary):
+
+SELECT
+  *
+FROM
+  ML.PREDICT(MODEL bike_model.model_bucketized,
+    (
+    SELECT
+      'Park Lane , Hyde Park' AS start_station_name,
+      CURRENT_TIMESTAMP() AS start_date) )
+      
+To make batch predictions on a sample of 100 rows in the training set use the query:
+
+SELECT
+  *
+FROM
+  ML.PREDICT(MODEL bike_model.model_bucketized,
+    (
+    SELECT
+      start_station_name,
+      start_date
+    FROM
+      `bigquery-public-data`.london_bicycles.cycle_hire
+    LIMIT
+      100) )
+      
+Examine model weights
+A linear regression model predicts the output as a weighted sum of its inputs. Often times, the weights of the model need to be utilized in a production environment.
+
+Examine (or export) the weights of your model using the query below:
+
+SELECT * FROM ML.WEIGHTS(MODEL bike_model.model_bucketized)
+
